@@ -43,6 +43,8 @@ std::string read_string_arg(char** argv, int argc, const std::string& name, cons
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
     try {
+        int rank = 0;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
         const int n = read_int_arg(argv, argc, "--n", 24);
         const int steps = read_int_arg(argv, argc, "--steps", 80);
         const int max_steps = read_int_arg(argv, argc, "--max-steps", 10000000);
@@ -60,11 +62,17 @@ int main(int argc, char** argv) {
         const double length = 2.0 * pi;
         const double nu = length / (2.0 * pi * reynolds);
 
-        std::filesystem::create_directories(output_dir);
+        if (rank == 0) {
+            std::filesystem::create_directories(output_dir);
+        }
+        MPI_Barrier(MPI_COMM_WORLD);
         const std::string csv_path = output_dir + "/taylor_green_diagnostics.csv";
-        std::ofstream csv(csv_path);
-        csv << std::setprecision(17);
-        csv << "t,kinetic_energy,dissipation,enstrophy,max_spectral_divergence\n";
+        std::ofstream csv;
+        if (rank == 0) {
+            csv.open(csv_path);
+            csv << std::setprecision(17);
+            csv << "t,kinetic_energy,dissipation,enstrophy,max_spectral_divergence\n";
+        }
 
         spectral::SpectralNavierStokes solver({n, n, n}, {length, length, length}, nu, MPI_COMM_WORLD);
         auto u_hat = solver.to_spectral(solver.taylor_green());
@@ -78,9 +86,11 @@ int main(int argc, char** argv) {
         auto write_diagnostics_row = [&](double t) {
             const auto row = solver.diagnostics(u_hat, t);
             history.push_back(row);
-            csv << row.t << ',' << row.energy << ',' << row.dissipation << ',' << row.enstrophy << ','
-                << row.max_spectral_divergence << '\n';
-            csv.flush();
+            if (rank == 0) {
+                csv << row.t << ',' << row.energy << ',' << row.dissipation << ',' << row.enstrophy << ','
+                    << row.max_spectral_divergence << '\n';
+                csv.flush();
+            }
             return row;
         };
 
@@ -93,7 +103,9 @@ int main(int argc, char** argv) {
             int step = 0;
             double next_output = 0.0;
             auto row = write_diagnostics_row(t);
-            std::cout << "step " << step << "/" << max_steps << " t=" << t << " dt=0 E=" << row.energy << "\n";
+            if (rank == 0) {
+                std::cout << "step " << step << "/" << max_steps << " t=" << t << " dt=0 E=" << row.energy << "\n";
+            }
             next_output += output_dt;
 
             while (t < t_end - 1.0e-14) {
@@ -121,7 +133,7 @@ int main(int argc, char** argv) {
                 const bool output_due = t >= next_output - 1.0e-12 || t >= t_end - 1.0e-12;
                 if (output_due) {
                     row = write_diagnostics_row(t);
-                    if (history.size() == 2 || history.size() % 100 == 1 || t >= t_end - 1.0e-12) {
+                    if (rank == 0 && (history.size() == 2 || history.size() % 100 == 1 || t >= t_end - 1.0e-12)) {
                         std::cout << "step " << step << "/" << max_steps << " t=" << t << " dt=" << dt_step
                                   << " cfl=" << (max_u * dt_step / dx_min) << " E=" << row.energy << "\n";
                     }
@@ -134,7 +146,7 @@ int main(int argc, char** argv) {
             for (int step = 0; step <= steps; ++step) {
                 if (step % output_every == 0 || step == steps) {
                     const auto row = write_diagnostics_row(t);
-                    if (step % (100 * output_every) == 0 || step == steps) {
+                    if (rank == 0 && (step % (100 * output_every) == 0 || step == steps)) {
                         std::cout << "step " << step << "/" << steps << " t=" << t << " E=" << row.energy << "\n";
                     }
                 }
@@ -144,18 +156,22 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        csv.close();
+        if (rank == 0) {
+            csv.close();
+        }
 
         spectral::write_vorticity_ppm(output_dir + "/taylor_green_vorticity.ppm", solver, u_hat);
 
         const auto& last = history.back();
-        std::cout << std::setprecision(10)
-                  << "saved diagnostics: " << csv_path << "\n"
-                  << "saved vorticity image: " << output_dir << "/taylor_green_vorticity.ppm\n"
-                  << "final energy: " << last.energy << "\n"
-                  << "final dissipation: " << last.dissipation << "\n"
-                  << "max spectral divergence: " << last.max_spectral_divergence << "\n";
-        if (profile) {
+        if (rank == 0) {
+            std::cout << std::setprecision(10)
+                      << "saved diagnostics: " << csv_path << "\n"
+                      << "saved vorticity image: " << output_dir << "/taylor_green_vorticity.ppm\n"
+                      << "final energy: " << last.energy << "\n"
+                      << "final dissipation: " << last.dissipation << "\n"
+                      << "max spectral divergence: " << last.max_spectral_divergence << "\n";
+        }
+        if (profile && rank == 0) {
             const auto& p = solver.profile();
             std::cout << std::setprecision(6)
                       << "\nprofile_seconds\n"

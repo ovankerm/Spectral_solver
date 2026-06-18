@@ -62,21 +62,16 @@ VectorPhysical SpectralNavierStokes::taylor_green(double amplitude, int mode) co
         ScalarPhysical(static_cast<std::size_t>(fft_.physical_size()), 0.0),
         ScalarPhysical(static_cast<std::size_t>(fft_.physical_size()), 0.0),
     };
-    for (int iz = 0; iz < n[2]; ++iz) {
+    fft_.for_each_physical([&](std::size_t id, int ix, int iy, int iz) {
+        const double x = (ix + 0.5) * L[0] / n[0];
+        const double y = (iy + 0.5) * L[1] / n[1];
         const double z = (iz + 0.5) * L[2] / n[2];
-        for (int iy = 0; iy < n[1]; ++iy) {
-            const double y = (iy + 0.5) * L[1] / n[1];
-            for (int ix = 0; ix < n[0]; ++ix) {
-                const double x = (ix + 0.5) * L[0] / n[0];
-                const double ax = 2.0 * pi * mode * x / L[0];
-                const double ay = 2.0 * pi * mode * y / L[1];
-                const double az = 2.0 * pi * mode * z / L[2];
-                const std::size_t id = static_cast<std::size_t>(ix + n[0] * (iy + n[1] * iz));
-                u[0][id] = amplitude * std::sin(ax) * std::cos(ay) * std::cos(az);
-                u[1][id] = -amplitude * std::cos(ax) * std::sin(ay) * std::cos(az);
-            }
-        }
-    }
+        const double ax = 2.0 * pi * mode * x / L[0];
+        const double ay = 2.0 * pi * mode * y / L[1];
+        const double az = 2.0 * pi * mode * z / L[2];
+        u[0][id] = amplitude * std::sin(ax) * std::cos(ay) * std::cos(az);
+        u[1][id] = -amplitude * std::cos(ax) * std::sin(ay) * std::cos(az);
+    });
     return u;
 }
 
@@ -314,11 +309,13 @@ VectorSpectral SpectralNavierStokes::step_rk3(const VectorSpectral& u_hat, doubl
 }
 
 double SpectralNavierStokes::kinetic_energy(const VectorPhysical& u) const {
-    double sum = 0.0;
+    double local_sum = 0.0;
     for (std::size_t i = 0; i < u[0].size(); ++i) {
-        sum += 0.5 * (u[0][i] * u[0][i] + u[1][i] * u[1][i] + u[2][i] * u[2][i]);
+        local_sum += 0.5 * (u[0][i] * u[0][i] + u[1][i] * u[1][i] + u[2][i] * u[2][i]);
     }
-    return sum / static_cast<double>(u[0].size());
+    double global_sum = 0.0;
+    MPI_Allreduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM, fft_.comm());
+    return global_sum / static_cast<double>(fft_.global_physical_size());
 }
 
 double SpectralNavierStokes::kinetic_energy_spectral(const VectorSpectral& u_hat) {
@@ -333,7 +330,9 @@ double SpectralNavierStokes::max_velocity(const VectorSpectral& u_hat) {
             std::sqrt(u[0][i] * u[0][i] + u[1][i] * u[1][i] + u[2][i] * u[2][i]);
         max_value = std::max(max_value, speed);
     }
-    return max_value;
+    double global_max = 0.0;
+    MPI_Allreduce(&max_value, &global_max, 1, MPI_DOUBLE, MPI_MAX, fft_.comm());
+    return global_max;
 }
 
 VectorSpectral SpectralNavierStokes::vorticity_hat(const VectorSpectral& u_hat) const {
@@ -352,11 +351,13 @@ VectorSpectral SpectralNavierStokes::vorticity_hat(const VectorSpectral& u_hat) 
 
 double SpectralNavierStokes::enstrophy(const VectorSpectral& u_hat) {
     auto omega = to_physical(vorticity_hat(u_hat));
-    double sum = 0.0;
+    double local_sum = 0.0;
     for (std::size_t i = 0; i < omega[0].size(); ++i) {
-        sum += omega[0][i] * omega[0][i] + omega[1][i] * omega[1][i] + omega[2][i] * omega[2][i];
+        local_sum += omega[0][i] * omega[0][i] + omega[1][i] * omega[1][i] + omega[2][i] * omega[2][i];
     }
-    return 0.5 * sum / static_cast<double>(omega[0].size());
+    double global_sum = 0.0;
+    MPI_Allreduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM, fft_.comm());
+    return 0.5 * global_sum / static_cast<double>(fft_.global_physical_size());
 }
 
 double SpectralNavierStokes::dissipation(const VectorSpectral& u_hat) {
@@ -364,14 +365,16 @@ double SpectralNavierStokes::dissipation(const VectorSpectral& u_hat) {
 }
 
 double SpectralNavierStokes::max_spectral_divergence(const VectorSpectral& u_hat) const {
-    double max_div = 0.0;
+    double local_max_div = 0.0;
     fft_.for_each_spectral([&](std::size_t id, const SpectralMode& mode) {
         const auto div = mode.kx * load_complex(u_hat[0], id)
                        + mode.ky * load_complex(u_hat[1], id)
                        + mode.kz * load_complex(u_hat[2], id);
-        max_div = std::max(max_div, std::abs(div));
+        local_max_div = std::max(local_max_div, std::abs(div));
     });
-    return max_div;
+    double global_max_div = 0.0;
+    MPI_Allreduce(&local_max_div, &global_max_div, 1, MPI_DOUBLE, MPI_MAX, fft_.comm());
+    return global_max_div;
 }
 
 Diagnostics SpectralNavierStokes::diagnostics(const VectorSpectral& u_hat, double t) {
@@ -420,14 +423,48 @@ void write_vorticity_ppm(const std::string& path, SpectralNavierStokes& solver, 
     const auto& n = solver.fft().shape();
     const int mid = n[2] / 2;
     std::vector<double> mag(static_cast<std::size_t>(n[0] * n[1]), 0.0);
-    double max_value = 0.0;
-    for (int iy = 0; iy < n[1]; ++iy) {
-        for (int ix = 0; ix < n[0]; ++ix) {
-            const std::size_t src = static_cast<std::size_t>(ix + n[0] * (iy + n[1] * mid));
-            const std::size_t dst = static_cast<std::size_t>(ix + n[0] * iy);
-            mag[dst] = std::sqrt(omega[0][src] * omega[0][src] + omega[1][src] * omega[1][src] + omega[2][src] * omega[2][src]);
-            max_value = std::max(max_value, mag[dst]);
+
+    std::vector<int> local_indices;
+    std::vector<double> local_values;
+    solver.fft().for_each_physical([&](std::size_t src, int ix, int iy, int iz) {
+        if (iz == mid) {
+            local_indices.push_back(ix + n[0] * iy);
+            local_values.push_back(std::sqrt(omega[0][src] * omega[0][src] + omega[1][src] * omega[1][src]
+                                             + omega[2][src] * omega[2][src]));
         }
+    });
+
+    const int rank = solver.fft().rank();
+    const int comm_size = solver.fft().comm_size();
+    const int local_count = static_cast<int>(local_values.size());
+    std::vector<int> counts(static_cast<std::size_t>(comm_size), 0);
+    MPI_Gather(&local_count, 1, MPI_INT, counts.data(), 1, MPI_INT, 0, solver.fft().comm());
+
+    std::vector<int> displacements(static_cast<std::size_t>(comm_size), 0);
+    int total_count = 0;
+    if (rank == 0) {
+        for (int r = 0; r < comm_size; ++r) {
+            displacements[static_cast<std::size_t>(r)] = total_count;
+            total_count += counts[static_cast<std::size_t>(r)];
+        }
+    }
+
+    std::vector<int> gathered_indices(static_cast<std::size_t>(std::max(total_count, 0)), 0);
+    std::vector<double> gathered_values(static_cast<std::size_t>(std::max(total_count, 0)), 0.0);
+    MPI_Gatherv(local_indices.data(), local_count, MPI_INT, gathered_indices.data(), counts.data(),
+                displacements.data(), MPI_INT, 0, solver.fft().comm());
+    MPI_Gatherv(local_values.data(), local_count, MPI_DOUBLE, gathered_values.data(), counts.data(),
+                displacements.data(), MPI_DOUBLE, 0, solver.fft().comm());
+
+    if (rank != 0) {
+        return;
+    }
+
+    double max_value = 0.0;
+    for (int i = 0; i < total_count; ++i) {
+        mag[static_cast<std::size_t>(gathered_indices[static_cast<std::size_t>(i)])] =
+            gathered_values[static_cast<std::size_t>(i)];
+        max_value = std::max(max_value, gathered_values[static_cast<std::size_t>(i)]);
     }
     if (max_value == 0.0) {
         max_value = 1.0;

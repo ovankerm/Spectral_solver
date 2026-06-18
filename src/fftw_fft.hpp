@@ -21,7 +21,23 @@ public:
     const std::array<int, 3>& shape() const { return shape_; }
     const std::array<double, 3>& lengths() const { return lengths_; }
     int physical_size() const { return shape_[0] * shape_[1] * shape_[2]; }
+    int global_physical_size() const { return physical_size(); }
     std::size_t spectral_storage_size() const { return 2 * static_cast<std::size_t>(physical_size()); }
+    MPI_Comm comm() const { return MPI_COMM_SELF; }
+    int rank() const { return 0; }
+    int comm_size() const { return 1; }
+
+    template <class Func>
+    void for_each_physical(Func&& func) const {
+        for (int iz = 0; iz < shape_[2]; ++iz) {
+            for (int iy = 0; iy < shape_[1]; ++iy) {
+                for (int ix = 0; ix < shape_[0]; ++ix) {
+                    const std::size_t id = static_cast<std::size_t>(ix + shape_[0] * (iy + shape_[1] * iz));
+                    func(id, ix, iy, iz);
+                }
+            }
+        }
+    }
 
     std::vector<double> forward(const std::vector<double>& physical);
     std::vector<double> backward(const std::vector<double>& spectral);

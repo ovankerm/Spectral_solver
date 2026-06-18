@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <iostream>
 #include <numeric>
 #include <stdexcept>
 
@@ -16,11 +17,8 @@ FlupsFft3D::FlupsFft3D(std::array<int, 3> shape, std::array<double, 3> lengths, 
         throw std::runtime_error("MPI must be initialized before constructing FlupsFft3D");
     }
 
-    int comm_size = 0;
-    MPI_Comm_size(comm_, &comm_size);
-    if (comm_size != 1) {
-        throw std::runtime_error("This standalone Navier-Stokes layer currently supports one MPI rank");
-    }
+    MPI_Comm_rank(comm_, &rank_);
+    MPI_Comm_size(comm_, &comm_size_);
 
     for (int n : shape_) {
         if (n <= 1) {
@@ -34,7 +32,8 @@ FlupsFft3D::FlupsFft3D(std::array<int, 3> shape, std::array<double, 3> lengths, 
     }
 
     const int nglob[3] = {shape_[0], shape_[1], shape_[2]};
-    const int nproc[3] = {1, 1, 1};
+    int nproc[3] = {0, 0, 0};
+    MPI_Dims_create(comm_size_, 3, nproc);
     topo_in_ = flups_topo_new(0, 1, nglob, nproc, false, nullptr, FLUPS_ALIGNMENT, comm_);
 
     for (int id = 0; id < 3; ++id) {
@@ -61,6 +60,7 @@ FlupsFft3D::FlupsFft3D(std::array<int, 3> shape, std::array<double, 3> lengths, 
     for (int d = 0; d < 3; ++d) {
         nmem_in_[d] = flups_topo_get_nmem(topo_in_, d);
         nmem_spec_[d] = flups_topo_get_nmem(topo_spec_, d);
+        nloc_in_[d] = flups_topo_get_nloc(topo_in_, d);
     }
     flups_topo_get_istartGlob(topo_in_, istart_in_);
     flups_topo_get_istartGlob(topo_spec_, istart_spec_);
@@ -68,6 +68,7 @@ FlupsFft3D::FlupsFft3D(std::array<int, 3> shape, std::array<double, 3> lengths, 
 
     physical_storage_size_ = flups_topo_get_memsize(topo_in_);
     spectral_storage_size_ = flups_topo_get_memsize(topo_spec_);
+    local_physical_size_ = nloc_in_[0] * nloc_in_[1] * nloc_in_[2];
 
     calibrate_inverse_scale();
 }
@@ -118,10 +119,10 @@ void FlupsFft3D::copy_physical_to_buffer(const std::vector<double>& physical) {
     }
     std::fill(buffer_, buffer_ + flups_get_allocSize(solver_), 0.0);
 
-    for (int iz = 0; iz < shape_[2]; ++iz) {
-        for (int iy = 0; iy < shape_[1]; ++iy) {
-            for (int ix = 0; ix < shape_[0]; ++ix) {
-                const std::size_t src = static_cast<std::size_t>(ix + shape_[0] * (iy + shape_[1] * iz));
+    for (int iz = 0; iz < nloc_in_[2]; ++iz) {
+        for (int iy = 0; iy < nloc_in_[1]; ++iy) {
+            for (int ix = 0; ix < nloc_in_[0]; ++ix) {
+                const std::size_t src = static_cast<std::size_t>(ix + nloc_in_[0] * (iy + nloc_in_[1] * iz));
                 const std::size_t dst = flups_locID(0, ix, iy, iz, 0, 0, nmem_in_, 1);
                 buffer_[dst] = physical[src];
             }
@@ -131,10 +132,10 @@ void FlupsFft3D::copy_physical_to_buffer(const std::vector<double>& physical) {
 
 std::vector<double> FlupsFft3D::copy_physical_from_buffer() const {
     std::vector<double> physical(static_cast<std::size_t>(physical_size()), 0.0);
-    for (int iz = 0; iz < shape_[2]; ++iz) {
-        for (int iy = 0; iy < shape_[1]; ++iy) {
-            for (int ix = 0; ix < shape_[0]; ++ix) {
-                const std::size_t dst = static_cast<std::size_t>(ix + shape_[0] * (iy + shape_[1] * iz));
+    for (int iz = 0; iz < nloc_in_[2]; ++iz) {
+        for (int iy = 0; iy < nloc_in_[1]; ++iy) {
+            for (int ix = 0; ix < nloc_in_[0]; ++ix) {
+                const std::size_t dst = static_cast<std::size_t>(ix + nloc_in_[0] * (iy + nloc_in_[1] * iz));
                 const std::size_t src = flups_locID(0, ix, iy, iz, 0, 0, nmem_in_, 1);
                 physical[dst] = buffer_[src];
             }
@@ -147,7 +148,10 @@ void FlupsFft3D::calibrate_inverse_scale() {
     std::vector<double> ones(static_cast<std::size_t>(physical_size()), 1.0);
     auto spectrum = forward(ones);
     auto roundtrip = backward(spectrum);
-    const double mean = std::accumulate(roundtrip.begin(), roundtrip.end(), 0.0) / roundtrip.size();
+    const double local_sum = std::accumulate(roundtrip.begin(), roundtrip.end(), 0.0);
+    double global_sum = 0.0;
+    MPI_Allreduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM, comm_);
+    const double mean = global_sum / static_cast<double>(global_physical_size());
     if (std::abs(mean) < 1.0e-30) {
         throw std::runtime_error("failed to calibrate FLUPS inverse FFT scale");
     }
