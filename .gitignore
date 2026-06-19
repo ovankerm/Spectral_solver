@@ -1,0 +1,16 @@
+.direnv/
+.matplotlib-cache/
+build*/
+output*/
+*.o
+*.so
+*.a
+*.json
+*.speedscope
+Benchmark.html
+Benchmark.pdf
+benchmark_pdf.css
+poll.sh
+BENCHMARK_64.md
+DOCKER_GPU.md
+docker/

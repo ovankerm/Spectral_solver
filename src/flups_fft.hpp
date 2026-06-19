@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <vector>
 
 #include <mpi.h>
@@ -8,6 +9,11 @@
 #include <flups.h>
 
 namespace spectral {
+
+struct FlupsComplex {
+    double x;
+    double y;
+};
 
 struct SpectralMode {
     double kx = 0.0;
@@ -51,6 +57,8 @@ public:
 
     std::vector<double> forward(const std::vector<double>& physical);
     std::vector<double> backward(const std::vector<double>& spectral);
+    void forward_device(const FlupsComplex* physical, FlupsComplex* spectral);
+    void backward_device(const FlupsComplex* spectral, FlupsComplex* physical);
 
     template <class Func>
     void for_each_spectral(Func&& func) const {
@@ -92,6 +100,7 @@ public:
 private:
     void copy_physical_to_buffer(const std::vector<double>& physical);
     std::vector<double> copy_physical_from_buffer() const;
+    void initialize_index_maps();
     void calibrate_inverse_scale();
 
     std::array<int, 3> shape_{};
@@ -115,7 +124,12 @@ private:
     std::size_t physical_storage_size_ = 0;
     std::size_t spectral_storage_size_ = 0;
     int local_physical_size_ = 0;
+    int local_spectral_size_ = 0;
     double backward_scale_ = 1.0;
+    std::vector<std::size_t> physical_storage_index_;
+    std::vector<std::size_t> spectral_storage_index_;
+    std::size_t* physical_storage_index_device_ = nullptr;
+    std::size_t* spectral_storage_index_device_ = nullptr;
 };
 
 }  // namespace spectral
